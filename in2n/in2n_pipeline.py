@@ -57,6 +57,8 @@ class InstructNeRF2NeRFPipelineConfig(VanillaPipelineConfig):
     """Second device to place InstructPix2Pix on. If None, will use the same device as the pipeline"""
     ip2p_use_full_precision: bool = True
     """Whether to use full precision for InstructPix2Pix"""
+    sds_weight: float = 0.
+    """the weight of SDS loss"""
 
 class InstructNeRF2NeRFPipeline(VanillaPipeline):
     """InstructNeRF2NeRF pipeline"""
@@ -82,6 +84,8 @@ class InstructNeRF2NeRFPipeline(VanillaPipeline):
         )
 
         self.ip2p = InstructPix2Pix(self.ip2p_device, ip2p_use_full_precision=self.config.ip2p_use_full_precision)
+        # self.ip2p = InstructPix2Pix(device=self.ip2p_device, num_train_timesteps=1000)
+
 
         # load base text embedding using classifier free guidance
         self.text_embedding = self.ip2p.pipe._encode_prompt(
@@ -98,6 +102,7 @@ class InstructNeRF2NeRFPipeline(VanillaPipeline):
         self.prompt_box = ViewerText(name="Prompt", default_value=self.config.prompt, cb_hook=self.prompt_callback)
         self.guidance_scale_box = ViewerNumber(name="Text Guidance Scale", default_value=self.config.guidance_scale, cb_hook=self.guidance_scale_callback)
         self.image_guidance_scale_box = ViewerNumber(name="Image Guidance Scale", default_value=self.config.image_guidance_scale, cb_hook=self.image_guidance_scale_callback)
+        self.sds_weight = ViewerNumber(name="SDS Weight", default_value=self.config.sds_weight, cb_hook=self.sds_weight_callback)
 
 
     def guidance_scale_callback(self, handle: ViewerText) -> None:
@@ -106,7 +111,11 @@ class InstructNeRF2NeRFPipeline(VanillaPipeline):
 
     def image_guidance_scale_callback(self, handle: ViewerText) -> None:
         """Callback for text guidance scale slider"""
-        self.config.image_guidance_scale = handle.value
+        self.config.image_guidance_scale = handle.value\
+    
+    def sds_weight_callback(self, handle: ViewerText) -> None:
+        """Callback for sds weight"""
+        self.config.sds_weight = handle.value
 
     def prompt_callback(self, handle: ViewerText) -> None:
         """Callback for prompt box, change prompt in config and update text embedding"""
@@ -158,7 +167,7 @@ class InstructNeRF2NeRFPipeline(VanillaPipeline):
                 del camera_transforms
                 torch.cuda.empty_cache()
 
-                edited_image = self.ip2p.edit_image(
+                edited_image, sds_loss = self.ip2p.edit_image(
                             self.text_embedding.to(self.ip2p_device),
                             rendered_image.to(self.ip2p_device),
                             original_image.to(self.ip2p_device),
@@ -168,7 +177,21 @@ class InstructNeRF2NeRFPipeline(VanillaPipeline):
                             lower_bound=self.config.lower_bound,
                             upper_bound=self.config.upper_bound,
                         )
-
+                
+                # editing_output = self.ip2p(
+                #     imgs=rendered_image,
+                #     cond_img=original_image, 
+                #     prompts=self.config.prompt, 
+                #     negative_prompts="", 
+                #     num_inference_steps=self.config.diffusion_steps, 
+                #     guidance_scale=self.config.guidance_scale, 
+                #     condition_scale=self.config.image_guidance_scale, 
+                #     latents=None
+                # )         
+                       
+                # edited_image = editing_output['edited_images']
+                # loss_sds = editing_output['loss_sds']
+                
                 # resize to original image size (often not necessary)
                 if (edited_image.size() != rendered_image.size()):
                     edited_image = torch.nn.functional.interpolate(edited_image, size=rendered_image.size()[2:], mode='bilinear')
@@ -177,6 +200,12 @@ class InstructNeRF2NeRFPipeline(VanillaPipeline):
                 self.datamanager.image_batch["image"][current_spot] = edited_image.squeeze().permute(1,2,0)
 
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        loss_dict['rgb_loss'] = torch.tensor(0.)
+        
+        
+        if(step % self.config.edit_rate == 0):
+            loss_dict['sds_loss'] = sds_loss * self.config.sds_weight
+        
 
         return model_outputs, loss_dict, metrics_dict
 
