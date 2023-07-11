@@ -1,4 +1,4 @@
-# Copyright 2022 The Nerfstudio Team. All rights reserved.
+# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,212 +12,218 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""InstructPix2Pix module"""
+"""
+Profiler base class and functionality
+"""
+from __future__ import annotations
 
-# Modified from https://github.com/ashawkey/stable-dreamfusion/blob/main/nerf/sd.py
+import functools
+import os
+import time
+import typing
+from collections import deque
+from contextlib import ContextDecorator, contextmanager
+from pathlib import Path
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+    overload,
+)
 
-import sys
-from dataclasses import dataclass
-from typing import Union
+from torch.profiler import ProfilerActivity, profile, record_function
 
-import torch
-from rich.console import Console
-from torch import Tensor, nn
-from jaxtyping import Float
+from nerfstudio.configs import base_config as cfg
+from nerfstudio.utils import comms
+from nerfstudio.utils.decorators import (
+    check_main_thread,
+    check_profiler_enabled,
+    decorate_all,
+)
+from nerfstudio.utils.rich_utils import CONSOLE
 
-CONSOLE = Console(width=120)
-
-try:
-    from diffusers import (
-        DDIMScheduler,
-        StableDiffusionInstructPix2PixPipeline,
-    )
-    from transformers import logging
-
-except ImportError:
-    CONSOLE.print("[bold red]Missing Stable Diffusion packages.")
-    CONSOLE.print(r"Install using [yellow]pip install nerfstudio\[gen][/yellow]")
-    CONSOLE.print(r"or [yellow]pip install -e .\[gen][/yellow] if installing from source.")
-    sys.exit(1)
-
-logging.set_verbosity_error()
-IMG_DIM = 512
-CONST_SCALE = 0.18215
-
-DDIM_SOURCE = "CompVis/stable-diffusion-v1-4"
-SD_SOURCE = "runwayml/stable-diffusion-v1-5"
-CLIP_SOURCE = "openai/clip-vit-large-patch14"
-IP2P_SOURCE = "timbrooks/instruct-pix2pix"
+PROFILER = []
+PYTORCH_PROFILER = None
 
 
-@dataclass
-class UNet2DConditionOutput:
-    sample: torch.FloatTensor
+CallableT = TypeVar("CallableT", bound=Callable)
 
-class InstructPix2Pix(nn.Module):
-    """InstructPix2Pix implementation
+
+@overload
+def time_function(name_or_func: CallableT) -> CallableT:
+    ...
+
+
+@overload
+def time_function(name_or_func: str) -> ContextManager[Any]:
+    ...
+
+
+def time_function(name_or_func: Union[CallableT, str]) -> Union[CallableT, ContextManager[Any]]:
+    """Profile a function or block of code. Can be used either to create a context or to wrap a function.
+
     Args:
-        device: device to use
-        num_train_timesteps: number of training timesteps
+        name_or_func: Either the name of a context or function to profile.
+
+    Returns:
+        A wrapped function or context to use in a `with` statement.
+    """
+    return _TimeFunction(name_or_func)
+
+
+class _TimeFunction(ContextDecorator):
+    """Decorator/Context manager: time a function call or a block of code"""
+
+    def __init__(self, name: Union[str, Callable]):
+        # NOTE: This is a workaround for the fact that the __new__ method of a ContextDecorator
+        # is not picked up by VSCode intellisense
+        self.name: str = typing.cast(str, name)
+        self.start = None
+        self._profiler_contexts = deque()
+        self._function_call_args: Optional[Tuple[Tuple, Dict]] = None
+
+    def __new__(cls, func: Union[str, Callable]):
+        instance = super().__new__(cls)
+        if isinstance(func, str):
+            instance.__init__(func)
+            return instance
+        if callable(func):
+            instance.__init__(func.__qualname__)
+            return instance(func)
+        raise ValueError(f"Argument func of type {type(func)} is not a string or a callable.")
+
+    def __enter__(self):
+        self.start = time.time()
+        if PYTORCH_PROFILER is not None:
+            args, kwargs = tuple(), {}
+            if self._function_call_args is not None:
+                args, kwargs = self._function_call_args
+            ctx = PYTORCH_PROFILER.record_function(self.name, *args, **kwargs)
+            ctx.__enter__()
+            self._profiler_contexts.append(ctx)
+            if self._function_call_args is None:
+                ctx = record_function(self.name)
+                ctx.__enter__()
+                self._profiler_contexts.append(ctx)
+
+    def __exit__(self, *args, **kwargs):
+        while self._profiler_contexts:
+            context = self._profiler_contexts.pop()
+            context.__exit__(*args, **kwargs)
+        if PROFILER:
+            PROFILER[0].update_time(self.name, self.start, time.time())
+
+    def __call__(self, func: Callable):
+        @functools.wraps(func)
+        def inner(*args, **kwargs):
+            self._function_call_args = (args, kwargs)
+            with self:
+                out = func(*args, **kwargs)
+            self._function_call_args = None
+            return out
+
+        return inner
+
+
+def flush_profiler(config: cfg.LoggingConfig):
+    """Method that checks if profiler is enabled before flushing"""
+    if config.profiler != "none" and PROFILER:
+        PROFILER[0].print_profile()
+
+
+def setup_profiler(config: cfg.LoggingConfig, log_dir: Path):
+    """Initialization of profilers"""
+    global PYTORCH_PROFILER
+    if comms.is_main_process():
+        PROFILER.append(Profiler(config))
+        if config.profiler == "pytorch":
+            PYTORCH_PROFILER = PytorchProfiler(log_dir)
+
+
+class PytorchProfiler:
+    """
+    Wrapper for Pytorch Profiler
     """
 
-    def __init__(self, device: Union[torch.device, str], num_train_timesteps: int = 1000, ip2p_use_full_precision=False) -> None:
-        super().__init__()
+    def __init__(self, output_path: Path, trace_steps: Optional[List[int]] = None):
+        self.output_path = output_path / "profiler_traces"
+        if trace_steps is None:
+            # Some arbitrary steps which likely do not overlap with steps usually chosen to run callbacks
+            trace_steps = [12, 17]
+        self.trace_steps = trace_steps
 
-        self.device = device
-        self.num_train_timesteps = num_train_timesteps
-        self.ip2p_use_full_precision = ip2p_use_full_precision
-
-        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(IP2P_SOURCE, torch_dtype=torch.float16, safety_checker=None)
-        pipe.scheduler = DDIMScheduler.from_pretrained(DDIM_SOURCE, subfolder="scheduler")
-        pipe.scheduler.set_timesteps(100)
-        assert pipe is not None
-        pipe = pipe.to(self.device)
-
-        self.pipe = pipe
-
-        # improve memory performance
-        pipe.enable_attention_slicing()
-
-        self.scheduler = pipe.scheduler
-        self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # type: ignore
-
-        pipe.unet.eval()
-        pipe.vae.eval()
-
-        # use for improved quality at cost of higher memory
-        if self.ip2p_use_full_precision:
-            pipe.unet.float()
-            pipe.vae.float()
-        else:
-            if self.device.index:
-                pipe.enable_model_cpu_offload(self.device.index)
-            else:
-                pipe.enable_model_cpu_offload(0)
-
-        self.unet = pipe.unet
-        self.auto_encoder = pipe.vae
-
-        CONSOLE.print("InstructPix2Pix loaded!")
-
-    def edit_image(
-        self,
-        text_embeddings: Float[Tensor, "N max_length embed_dim"],
-        image: Float[Tensor, "BS 3 H W"],
-        image_cond: Float[Tensor, "BS 3 H W"],
-        guidance_scale: float = 7.5,
-        image_guidance_scale: float = 1.5,
-        diffusion_steps: int = 20,
-        lower_bound: float = 0.70,
-        upper_bound: float = 0.98
-    ) -> torch.Tensor:
-        """Edit an image for Instruct-NeRF2NeRF using InstructPix2Pix
-        Args:
-            text_embeddings: Text embeddings
-            image: rendered image to edit
-            image_cond: corresponding training image to condition on
-            guidance_scale: text-guidance scale
-            image_guidance_scale: image-guidance scale
-            diffusion_steps: number of diffusion steps
-            lower_bound: lower bound for diffusion timesteps to use for image editing
-            upper_bound: upper bound for diffusion timesteps to use for image editing
-        Returns:
-            edited image
+    @contextmanager
+    def record_function(self, function: str, *args, **_kwargs):
         """
-
-        min_step = int(self.num_train_timesteps * lower_bound)
-        max_step = int(self.num_train_timesteps * upper_bound)
-
-        # select t, set multi-step diffusion
-        T = torch.randint(min_step, max_step + 1, [1], dtype=torch.long, device=self.device)
-        
-        self.scheduler.config.num_train_timesteps = T.item()
-        self.scheduler.set_timesteps(diffusion_steps)
-
-        with torch.no_grad():
-            # prepare image and image_cond latents
-            latents = self.imgs_to_latent(image)
-            image_cond_latents = self.prepare_image_latents(image_cond)
-
-        # add noise
-        noise = torch.randn_like(latents)
-        latents = self.scheduler.add_noise(latents, noise, self.scheduler.timesteps[0])  # type: ignore
-
-        # sections of code used from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
-        for i, t in enumerate(self.scheduler.timesteps):
-
-            # predict the noise residual with unet, NO grad!
-            with torch.no_grad():
-                # pred noise
-                latent_model_input = torch.cat([latents] * 3)
-                latent_model_input = torch.cat([latent_model_input, image_cond_latents], dim=1)
-
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-
-            # perform classifier-free guidance
-            noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-            noise_pred = (
-                noise_pred_uncond
-                + guidance_scale * (noise_pred_text - noise_pred_image)
-                + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-            )
-
-            # get previous sample, continue loop
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-
-        # decode latents to get edited image
-        with torch.no_grad():
-            decoded_img = self.latents_to_img(latents)
-
-        return decoded_img
-
-    def latents_to_img(self, latents: Float[Tensor, "BS 4 H W"]) -> Float[Tensor, "BS 3 H W"]:
-        """Convert latents to images
-        Args:
-            latents: Latents to convert
-        Returns:
-            Images
+        Context manager that records a function call and saves the trace to a json file.
+        Traced functions are: train_iteration, eval_iteration
         """
+        if function.endswith("train_iteration") or function.endswith("eval_iteration"):
+            step = args[1]
+            assert isinstance(step, int)
+            assert len(args) == 2
+            stage = function.split(".")[-1].split("_")[0]
+            if step in self.trace_steps:
+                launch_kernel_blocking = self.trace_steps.index(step) % 2 == 0
+                backup_lb_var = ""
+                if launch_kernel_blocking:
+                    backup_lb_var = os.environ.get("CUDA_LAUNCH_BLOCKING", "")
+                    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    with_stack=True,
+                    profile_memory=True,
+                ) as prof:
+                    yield None
+                if launch_kernel_blocking:
+                    os.environ["CUDA_LAUNCH_BLOCKING"] = backup_lb_var
+                self.output_path.mkdir(parents=True, exist_ok=True)
+                prof.export_chrome_trace(
+                    str(self.output_path / f"trace_{stage}_{step}{'_blocking' if launch_kernel_blocking else ''}.json")
+                )
+                return
+        # Functions are recorded automatically
+        yield None
+        return
 
-        latents = 1 / CONST_SCALE * latents
 
-        with torch.no_grad():
-            imgs = self.auto_encoder.decode(latents).sample
+@decorate_all([check_profiler_enabled, check_main_thread])
+class Profiler:
+    """Profiler class"""
 
-        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+    def __init__(self, config: cfg.LoggingConfig):
+        self.config = config
+        self.profiler_dict = {}
 
-        return imgs
+    def update_time(self, func_name: str, start_time: float, end_time: float):
+        """update the profiler dictionary with running averages of durations
 
-    def imgs_to_latent(self, imgs: Float[Tensor, "BS 3 H W"]) -> Float[Tensor, "BS 4 H W"]:
-        """Convert images to latents
         Args:
-            imgs: Images to convert
-        Returns:
-            Latents
+            func_name: the function name that is being profiled
+            start_time: the start time when function is called
+            end_time: the end time when function terminated
         """
-        imgs = 2 * imgs - 1
+        val = end_time - start_time
+        func_dict = self.profiler_dict.get(func_name, {"val": 0, "step": 0})
+        prev_val = func_dict["val"]
+        prev_step = func_dict["step"]
+        self.profiler_dict[func_name] = {"val": (prev_val * prev_step + val) / (prev_step + 1), "step": prev_step + 1}
 
-        posterior = self.auto_encoder.encode(imgs).latent_dist
-        latents = posterior.sample() * CONST_SCALE
-
-        return latents
-
-    def prepare_image_latents(self, imgs: Float[Tensor, "BS 3 H W"]) -> Float[Tensor, "BS 4 H W"]:
-        """Convert conditioning image to latents used for classifier-free guidance
-        Args:
-            imgs: Images to convert
-        Returns:
-            Latents
-        """
-        imgs = 2 * imgs - 1
-
-        image_latents = self.auto_encoder.encode(imgs).latent_dist.mode()
-
-        uncond_image_latents = torch.zeros_like(image_latents)
-        image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)
-
-        return image_latents
-
-    def forward(self):
-        """Not implemented since we only want the parameter saving of the nn module, but not forward()"""
-        raise NotImplementedError
+    def print_profile(self):
+        """helper to print out the profiler stats"""
+        CONSOLE.print("Printing profiling stats, from longest to shortest duration in seconds")
+        sorted_keys = sorted(
+            self.profiler_dict.keys(),
+            key=lambda k: self.profiler_dict[k]["val"],
+            reverse=True,
+        )
+        for k in sorted_keys:
+            val = f"{self.profiler_dict[k]['val']:0.4f}"
+            CONSOLE.print(f"{k:<20}: {val:<20}")
